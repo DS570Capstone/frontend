@@ -7,6 +7,7 @@ import { useRouter, useFocusEffect } from 'expo-router';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useEvent } from 'expo';
 import { killAllCameraStreams, registerCameraStream } from '../utils/cameraCleanup';
+import { uploadVideoToMinio } from '../utils/minioUpload';
 import '../src/global.css';
 
 const isWeb = Platform.OS === 'web';
@@ -18,6 +19,8 @@ export default function LiveCamera() {
   const [cameraActive, setCameraActive] = useState(false);
   const [recordingDone, setRecordingDone] = useState(false);
   const [recordedUri, setRecordedUri] = useState<string | null>(null);
+  const [videoId, setVideoId] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [cameraReady, setCameraReady] = useState(false);
   const [facing, setFacing] = useState<'front' | 'back'>('back');
@@ -118,7 +121,7 @@ export default function LiveCamera() {
             vid.playsInline = true;
             vid.muted = true;
             vid.srcObject = stream;
-            vid.style.cssText = 'width:100%;height:100%;object-fit:cover;position:absolute;top:0;left:0;';
+            vid.style.cssText = 'width:100%;height:100%;object-fit:cover;position:absolute;top:0;left:0;z-index:0;';
             domNode.style.position = 'relative';
             domNode.appendChild(vid);
             liveVideoRef.current = vid;
@@ -197,12 +200,24 @@ export default function LiveCamera() {
       chunksRef.current = [];
       const recorder = new MediaRecorder(streamRef.current, { mimeType: 'video/webm' });
       recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: 'video/webm' });
         const url = URL.createObjectURL(blob);
         setRecordedUri(url);
         setRecordingDone(true);
         setCameraActive(false);
+
+        // Upload to MinIO
+        setIsUploading(true);
+        try {
+          const id = await uploadVideoToMinio(url);
+          if (id) setVideoId(id);
+          else console.warn('MinIO upload failed, video only available locally');
+        } catch (err) {
+          console.error('MinIO upload error:', err);
+        } finally {
+          setIsUploading(false);
+        }
       };
       mediaRecorderRef.current = recorder;
       recorder.start();
@@ -216,6 +231,18 @@ export default function LiveCamera() {
           setRecordedUri(video.uri);
           setRecordingDone(true);
           setCameraActive(false);
+
+          // Upload to MinIO
+          setIsUploading(true);
+          try {
+            const id = await uploadVideoToMinio(video.uri);
+            if (id) setVideoId(id);
+            else console.warn('MinIO upload failed, video only available locally');
+          } catch (err) {
+            console.error('MinIO upload error:', err);
+          } finally {
+            setIsUploading(false);
+          }
         }
       } catch (err) {
         console.error('Native recording error:', err);
@@ -270,6 +297,7 @@ export default function LiveCamera() {
   const handleRecordAgain = useCallback(() => {
     if (recordedUri && isWeb) URL.revokeObjectURL(recordedUri);
     setRecordedUri(null);
+    setVideoId(null);
     setRecordingDone(false);
     setIsRecording(false);
     setPreviewPos(0);
@@ -281,11 +309,13 @@ export default function LiveCamera() {
 
   // ── VIEW ANALYSIS ──
   const handleViewAnalysis = useCallback(() => {
-    router.push(recordedUri
-      ? { pathname: '/dashboard', params: { videoUri: recordedUri } }
-      : '/dashboard'
+    router.push(videoId
+      ? { pathname: '/dashboard', params: { videoId } }
+      : recordedUri
+        ? { pathname: '/dashboard', params: { videoUri: recordedUri } }
+        : '/dashboard'
     );
-  }, [recordedUri, router]);
+  }, [videoId, recordedUri, router]);
 
   if (!camPermission) return <View className="flex-1 bg-[#09090b]" />;
 
@@ -324,7 +354,19 @@ export default function LiveCamera() {
               </View>
               <Text className="text-white font-semibold text-sm">Preview</Text>
             </View>
-            <Text className="text-zinc-600 font-mono text-[10px]">{fmt(elapsed)} recorded</Text>
+            <View className="flex-row items-center gap-2">
+              {isUploading && (
+                <View className="bg-yellow-500/20 px-2 py-0.5 rounded">
+                  <Text className="text-yellow-400 text-[9px] font-mono">Uploading...</Text>
+                </View>
+              )}
+              {videoId && !isUploading && (
+                <View className="bg-green-500/20 px-2 py-0.5 rounded">
+                  <Text className="text-green-400 text-[9px] font-mono">Saved ✓</Text>
+                </View>
+              )}
+              <Text className="text-zinc-600 font-mono text-[10px]">{fmt(elapsed)} recorded</Text>
+            </View>
           </View>
 
           {recordedUri ? (
@@ -355,9 +397,9 @@ export default function LiveCamera() {
           )}
 
           <View className="p-4 gap-2.5">
-            <TouchableOpacity onPress={handleViewAnalysis} className="bg-indigo-500 py-3 rounded-xl items-center flex-row justify-center gap-2">
+            <TouchableOpacity onPress={handleViewAnalysis} disabled={isUploading} className={`py-3 rounded-xl items-center flex-row justify-center gap-2 ${isUploading ? 'bg-indigo-500/50' : 'bg-indigo-500'}`}>
               <Feather name="bar-chart-2" size={15} color="#fff" />
-              <Text className="text-white font-semibold text-sm">View Analysis</Text>
+              <Text className="text-white font-semibold text-sm">{isUploading ? 'Uploading...' : 'View Analysis'}</Text>
             </TouchableOpacity>
             <View className="flex-row gap-2.5">
               <TouchableOpacity onPress={handleRecordAgain} className="flex-1 bg-zinc-800 py-2.5 rounded-xl items-center flex-row justify-center gap-1.5">
@@ -378,7 +420,7 @@ export default function LiveCamera() {
   // ── CAMERA VIEW ──
   // Shared overlay (absolute positioned so it works on top of CameraView without being a child)
   const overlay = (
-    <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+    <View style={[StyleSheet.absoluteFill, { zIndex: 10 }]} pointerEvents="box-none">
       <SafeAreaView style={{ flex: 1 }} edges={['top', 'bottom']} className="flex-1">
         {/* Header */}
         <View className="flex-row items-center justify-between px-5 py-3">

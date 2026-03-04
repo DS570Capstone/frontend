@@ -13,6 +13,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { useState, useCallback } from 'react';
 import { killAllCameraStreams } from '../utils/cameraCleanup';
+import { uploadVideoToMinio } from '../utils/minioUpload';
 import '../src/global.css';
 
 const { width } = Dimensions.get('window');
@@ -21,6 +22,7 @@ const isDesktop = width > 768;
 export default function App() {
   const router = useRouter();
   const [selectedVideo, setSelectedVideo] = useState<DocumentPicker.DocumentPickerAsset | null>(null);
+  const [videoId, setVideoId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
 
   // Kill any lingering camera streams when home page is displayed
@@ -35,10 +37,22 @@ export default function App() {
       const result = await DocumentPicker.getDocumentAsync({ type: 'video/*' });
       if (!result.canceled && result.assets.length > 0) {
         setIsUploading(true);
-        setTimeout(() => {
-          setSelectedVideo(result.assets[0]);
+        setSelectedVideo(result.assets[0]);
+
+        // Upload to MinIO
+        try {
+          const id = await uploadVideoToMinio(result.assets[0].uri);
+          if (id) {
+            setVideoId(id);
+            console.log('Video uploaded to MinIO:', id);
+          } else {
+            console.warn('MinIO upload failed, video only available locally');
+          }
+        } catch (err) {
+          console.error('MinIO upload error:', err);
+        } finally {
           setIsUploading(false);
-        }, 1500);
+        }
       }
     } catch (err) {
       console.log('Error picking video:', err);
@@ -78,8 +92,8 @@ export default function App() {
             {isUploading ? (
               <View className="items-center">
                 <Feather name="loader" size={36} color="#818cf8" />
-                <Text className="text-white font-semibold text-base mt-5 mb-1">Processing...</Text>
-                <Text className="text-zinc-600 text-xs">Extracting frames</Text>
+                <Text className="text-white font-semibold text-base mt-5 mb-1">Uploading...</Text>
+                <Text className="text-zinc-600 text-xs">Saving to storage</Text>
               </View>
             ) : selectedVideo ? (
               <View className="items-center w-full">
@@ -89,7 +103,7 @@ export default function App() {
                 <Text className="text-white font-bold text-lg mb-1">Ready</Text>
                 <Text className="text-zinc-600 text-xs mb-8 font-mono">{selectedVideo.name}</Text>
                 <TouchableOpacity
-                  onPress={() => router.push({ pathname: '/dashboard', params: { videoUri: selectedVideo.uri } })}
+                  onPress={() => router.push({ pathname: '/dashboard', params: videoId ? { videoId } : { videoUri: selectedVideo.uri } })}
                   className="bg-indigo-500 py-3 px-6 rounded-xl flex-row items-center gap-2 w-full justify-center"
                 >
                   <Feather name="arrow-right" size={16} color="#fff" />

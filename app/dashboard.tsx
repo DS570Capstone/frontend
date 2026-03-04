@@ -7,6 +7,7 @@ import { useEvent } from 'expo';
 import Svg, { Path, Line, Defs, LinearGradient as SvgGradient, Stop } from 'react-native-svg';
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { killAllCameraStreams } from '../utils/cameraCleanup';
+import { getVideoUrl, listVideos, deleteVideo, VideoItem } from '../utils/minioUpload';
 import '../src/global.css';
 
 const { width } = Dimensions.get('window');
@@ -225,7 +226,7 @@ function Chart({ jointId, exerciseId }: { jointId: string; exerciseId: string })
 
 export default function Dashboard() {
     const router = useRouter();
-    const { videoUri } = useLocalSearchParams<{ videoUri?: string }>();
+    const { videoUri, videoId } = useLocalSearchParams<{ videoUri?: string; videoId?: string }>();
 
     // Kill any lingering camera streams when dashboard is displayed
     useFocusEffect(
@@ -236,9 +237,60 @@ export default function Dashboard() {
 
     const [selectedExercise, setSelectedExercise] = useState('squat');
     const [showExercisePicker, setShowExercisePicker] = useState(false);
+    const [resolvedVideoUrl, setResolvedVideoUrl] = useState<string | null>(videoUri || null);
+    const [activeVideoId, setActiveVideoId] = useState<string | null>(videoId || null);
+
+    // Video history state
+    const [savedVideos, setSavedVideos] = useState<VideoItem[]>([]);
+    const [showHistory, setShowHistory] = useState(false);
+    const [loadingHistory, setLoadingHistory] = useState(false);
+
+    // Fetch presigned URL from MinIO if videoId is provided
+    useEffect(() => {
+        if (videoId) {
+            getVideoUrl(videoId).then(url => {
+                if (url) setResolvedVideoUrl(url);
+                else console.warn('Could not fetch video from MinIO, falling back to local URI');
+            });
+        } else if (videoUri) {
+            setResolvedVideoUrl(videoUri);
+        }
+    }, [videoId, videoUri]);
+
+    // Fetch saved videos on mount
+    const fetchHistory = useCallback(async () => {
+        setLoadingHistory(true);
+        const videos = await listVideos();
+        setSavedVideos(videos);
+        setLoadingHistory(false);
+    }, []);
+
+    useEffect(() => { fetchHistory(); }, []);
+
+    // Load a video from history
+    const handleLoadVideo = useCallback(async (vid: VideoItem) => {
+        const url = await getVideoUrl(vid.videoId);
+        if (url) {
+            setResolvedVideoUrl(url);
+            setActiveVideoId(vid.videoId);
+            setShowHistory(false);
+        }
+    }, []);
+
+    // Delete a video from history
+    const handleDeleteVideo = useCallback(async (vid: VideoItem) => {
+        const success = await deleteVideo(vid.videoId);
+        if (success) {
+            setSavedVideos(prev => prev.filter(v => v.videoId !== vid.videoId));
+            if (activeVideoId === vid.videoId) {
+                setResolvedVideoUrl(null);
+                setActiveVideoId(null);
+            }
+        }
+    }, [activeVideoId]);
 
     // expo-video player
-    const player = useVideoPlayer(videoUri || null, player => {
+    const player = useVideoPlayer(resolvedVideoUrl, player => {
         player.loop = true;
     });
 
@@ -332,6 +384,24 @@ export default function Dashboard() {
         </View>
     );
 
+    // Format file size
+    const formatSize = (bytes: number) => {
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    };
+
+    // Format date
+    const formatDate = (iso: string | null) => {
+        if (!iso) return '';
+        const d = new Date(iso);
+        const now = new Date();
+        const diff = now.getTime() - d.getTime();
+        if (diff < 60000) return 'Just now';
+        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+        return d.toLocaleDateString();
+    };
+
     const Header = () => (
         <View className="flex-row items-center justify-between px-4 py-2.5 border-b border-zinc-800 bg-black">
             <View className="flex-row items-center gap-3">
@@ -341,13 +411,87 @@ export default function Dashboard() {
                 <Text className="text-white font-semibold text-sm">Exercise Analysis</Text>
             </View>
             <View className="flex-row items-center gap-3">
-                <Text className="text-zinc-500 font-mono text-xs">0 Reps</Text>
+                <TouchableOpacity
+                    onPress={() => { setShowHistory(!showHistory); if (!showHistory) fetchHistory(); }}
+                    className={`w-8 h-8 rounded items-center justify-center ${showHistory ? 'bg-indigo-500' : 'bg-zinc-900'}`}
+                >
+                    <Feather name="film" size={14} color={showHistory ? '#fff' : '#aaa'} />
+                </TouchableOpacity>
                 <TouchableOpacity onPress={handleShare} className="w-8 h-8 bg-zinc-900 rounded items-center justify-center">
                     <Feather name="share" size={14} color="#aaa" />
                 </TouchableOpacity>
             </View>
         </View>
     );
+
+    const VideoHistory = () => {
+        if (!showHistory) return null;
+        return (
+            <View className="bg-[#111] border-b border-zinc-800">
+                <View className="flex-row items-center justify-between px-4 py-3">
+                    <View className="flex-row items-center gap-2">
+                        <Feather name="clock" size={14} color="#818cf8" />
+                        <Text className="text-white font-semibold text-sm">Saved Videos</Text>
+                    </View>
+                    <Text className="text-zinc-600 text-[10px] font-mono">{savedVideos.length} videos</Text>
+                </View>
+                {loadingHistory ? (
+                    <View className="px-4 pb-4 items-center">
+                        <Text className="text-zinc-600 text-xs">Loading...</Text>
+                    </View>
+                ) : savedVideos.length === 0 ? (
+                    <View className="px-4 pb-4 items-center">
+                        <Text className="text-zinc-600 text-xs">No saved videos yet</Text>
+                    </View>
+                ) : (
+                    <ScrollView style={{ maxHeight: 240 }} className="px-3 pb-3">
+                        {savedVideos.map((vid) => {
+                            const isActive = activeVideoId === vid.videoId;
+                            return (
+                                <View
+                                    key={vid.videoId}
+                                    className={`flex-row items-center justify-between rounded-lg px-3 py-2.5 mb-1.5 ${
+                                        isActive ? 'bg-indigo-500/15 border border-indigo-500/30' : 'bg-zinc-900/50'
+                                    }`}
+                                >
+                                    <TouchableOpacity
+                                        onPress={() => handleLoadVideo(vid)}
+                                        className="flex-1 flex-row items-center gap-2.5"
+                                        activeOpacity={0.7}
+                                    >
+                                        <View className={`w-8 h-8 rounded items-center justify-center ${
+                                            isActive ? 'bg-indigo-500/25' : 'bg-zinc-800'
+                                        }`}>
+                                            <Feather
+                                                name={isActive ? 'play' : 'film'}
+                                                size={14}
+                                                color={isActive ? '#818cf8' : '#666'}
+                                            />
+                                        </View>
+                                        <View className="flex-1">
+                                            <Text className={`text-xs font-medium ${isActive ? 'text-indigo-300' : 'text-zinc-300'}`} numberOfLines={1}>
+                                                {vid.objectName}
+                                            </Text>
+                                            <Text className="text-zinc-600 text-[9px] font-mono mt-0.5">
+                                                {formatSize(vid.size)} · {vid.extension.toUpperCase()} · {formatDate(vid.uploadedAt)}
+                                            </Text>
+                                        </View>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        onPress={() => handleDeleteVideo(vid)}
+                                        className="w-7 h-7 rounded items-center justify-center ml-2"
+                                        activeOpacity={0.6}
+                                    >
+                                        <Feather name="trash-2" size={12} color="#ef4444" />
+                                    </TouchableOpacity>
+                                </View>
+                            );
+                        })}
+                    </ScrollView>
+                )}
+            </View>
+        );
+    };
 
     // Exercise selector dropdown
     const ExercisePicker = () => (
@@ -443,11 +587,12 @@ export default function Dashboard() {
         return (
             <SafeAreaView className="flex-1 bg-black">
                 <Header />
+                <VideoHistory />
                 <View className="flex-1 flex-row">
                     {/* LEFT: Video + controls */}
                     <View className="flex-1 bg-zinc-950">
                         <ScrollView className="flex-1">
-                            {videoUri ? (
+                            {resolvedVideoUrl ? (
                                 <VideoView
                                     player={player}
                                     style={{ width: '100%', aspectRatio: 16 / 9 }}
@@ -480,9 +625,10 @@ export default function Dashboard() {
     return (
         <SafeAreaView className="flex-1 bg-black">
             <Header />
+            <VideoHistory />
             <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: 20 }}>
                 <View className="bg-zinc-950">
-                    {videoUri ? (
+                    {resolvedVideoUrl ? (
                         <VideoView
                             player={player}
                             style={{ width: '100%', aspectRatio: 16 / 9 }}
